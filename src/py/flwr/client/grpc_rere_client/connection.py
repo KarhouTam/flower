@@ -40,8 +40,13 @@ from flwr.common.grpc import create_channel
 from flwr.common.logger import log
 from flwr.common.message import Message, Metadata
 from flwr.common.retry_invoker import RetryInvoker
-from flwr.common.serde import message_from_taskins, message_to_taskres
-from flwr.common.typing import Run
+from flwr.common.serde import (
+    message_from_taskins,
+    message_to_taskres,
+    user_config_from_proto,
+)
+from flwr.common.typing import Fab, Run
+from flwr.proto.fab_pb2 import GetFabRequest, GetFabResponse  # pylint: disable=E0611
 from flwr.proto.fleet_pb2 import (  # pylint: disable=E0611
     CreateNodeRequest,
     DeleteNodeRequest,
@@ -79,9 +84,10 @@ def grpc_request_response(  # pylint: disable=R0913, R0914, R0915
     Tuple[
         Callable[[], Optional[Message]],
         Callable[[Message], None],
-        Optional[Callable[[], None]],
+        Optional[Callable[[], Optional[int]]],
         Optional[Callable[[], None]],
         Optional[Callable[[int], Run]],
+        Optional[Callable[[str], Fab]],
     ]
 ]:
     """Primitives for request/response-based interaction with a server.
@@ -176,7 +182,7 @@ def grpc_request_response(  # pylint: disable=R0913, R0914, R0915
         if not ping_stop_event.is_set():
             ping_stop_event.wait(next_interval)
 
-    def create_node() -> None:
+    def create_node() -> Optional[int]:
         """Set create_node."""
         # Call FleetAPI
         create_node_request = CreateNodeRequest(ping_interval=PING_DEFAULT_INTERVAL)
@@ -189,6 +195,7 @@ def grpc_request_response(  # pylint: disable=R0913, R0914, R0915
         nonlocal node, ping_thread
         node = cast(Node, create_node_response.node)
         ping_thread = start_ping_loop(ping, ping_stop_event)
+        return node.node_id
 
     def delete_node() -> None:
         """Set delete_node."""
@@ -280,11 +287,22 @@ def grpc_request_response(  # pylint: disable=R0913, R0914, R0915
             run_id,
             get_run_response.run.fab_id,
             get_run_response.run.fab_version,
-            dict(get_run_response.run.override_config.items()),
+            get_run_response.run.fab_hash,
+            user_config_from_proto(get_run_response.run.override_config),
         )
+
+    def get_fab(fab_hash: str) -> Fab:
+        # Call FleetAPI
+        get_fab_request = GetFabRequest(hash_str=fab_hash)
+        get_fab_response: GetFabResponse = retry_invoker.invoke(
+            stub.GetFab,
+            request=get_fab_request,
+        )
+
+        return Fab(get_fab_response.fab.hash_str, get_fab_response.fab.content)
 
     try:
         # Yield methods
-        yield (receive, send, create_node, delete_node, get_run)
+        yield (receive, send, create_node, delete_node, get_run, get_fab)
     except Exception as exc:  # pylint: disable=broad-except
         log(ERROR, exc)
