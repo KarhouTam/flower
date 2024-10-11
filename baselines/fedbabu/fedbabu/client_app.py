@@ -5,7 +5,7 @@ from flwr.client import NumPyClient, ClientApp
 from flwr.common import Context
 
 from fedbabu.task import (
-    Net,
+    MobileNetCifar,
     load_data,
     get_weights,
     set_weights,
@@ -26,26 +26,32 @@ class FlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         set_weights(self.net, parameters)
-        train_loss = train(
-            self.net,
-            self.trainloader,
-            self.local_epochs,
-            self.device,
+        train_loss = train(self.net, self.trainloader, self.local_epochs, self.device)
+        return (
+            get_weights(self.net),
+            len(self.trainloader.dataset),
+            {"train_loss": train_loss},
         )
-        return get_weights(self.net), len(self.trainloader.dataset), {"train_loss": train_loss}
 
     def evaluate(self, parameters, config):
         set_weights(self.net, parameters)
-        loss, accuracy = test(self.net, self.valloader, self.device)
+        loss, accuracy = test(
+            self.net,
+            self.valloader,
+            self.trainloader,
+            self.device,
+            config["finetune-epochs"],
+        )
         return loss, len(self.valloader.dataset), {"accuracy": accuracy}
 
 
 def client_fn(context: Context):
     # Load model and data
-    net = Net()
+    net = MobileNetCifar()
     partition_id = context.node_config["partition-id"]
     num_partitions = context.node_config["num-partitions"]
-    trainloader, valloader = load_data(partition_id, num_partitions)
+    alpha = context.client_config["alpha"]
+    trainloader, valloader = load_data(partition_id, num_partitions, alpha)
     local_epochs = context.run_config["local-epochs"]
 
     # Return Client instance
@@ -53,6 +59,4 @@ def client_fn(context: Context):
 
 
 # Flower ClientApp
-app = ClientApp(
-    client_fn,
-)
+app = ClientApp(client_fn)

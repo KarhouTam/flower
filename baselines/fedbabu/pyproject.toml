@@ -28,6 +28,8 @@ clientapp = "fedbabu.client_app:app"
 num-server-rounds = 3
 fraction-fit = 0.5
 local-epochs = 1
+finetune-epochs = 1
+alpha = 0.1
 
 [tool.flwr.federations]
 default = "local-simulation"
