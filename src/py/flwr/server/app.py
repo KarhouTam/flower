@@ -19,10 +19,11 @@ import csv
 import importlib.util
 import sys
 import threading
+from collections.abc import Sequence
 from logging import INFO, WARN
 from os.path import isfile
 from pathlib import Path
-from typing import Optional, Sequence, Set, Tuple
+from typing import Optional
 
 import grpc
 from cryptography.exceptions import UnsupportedAlgorithm
@@ -34,8 +35,15 @@ from cryptography.hazmat.primitives.serialization import (
 
 from flwr.common import GRPC_MAX_MESSAGE_LENGTH, EventType, event
 from flwr.common.address import parse_address
-from flwr.common.config import get_flwr_dir
+from flwr.common.config import get_flwr_dir, parse_config_args
 from flwr.common.constant import (
+    DRIVER_API_DEFAULT_ADDRESS,
+    EXEC_API_DEFAULT_ADDRESS,
+    FLEET_API_GRPC_BIDI_DEFAULT_ADDRESS,
+    FLEET_API_GRPC_RERE_DEFAULT_ADDRESS,
+    FLEET_API_REST_DEFAULT_ADDRESS,
+    ISOLATION_MODE_PROCESS,
+    ISOLATION_MODE_SUBPROCESS,
     MISSING_EXTRA_REST,
     TRANSPORT_TYPE_GRPC_ADAPTER,
     TRANSPORT_TYPE_GRPC_RERE,
@@ -51,6 +59,8 @@ from flwr.proto.fleet_pb2_grpc import (  # pylint: disable=E0611
     add_FleetServicer_to_server,
 )
 from flwr.proto.grpcadapter_pb2_grpc import add_GrpcAdapterServicer_to_server
+from flwr.superexec.app import load_executor
+from flwr.superexec.exec_grpc import run_superexec_api_grpc
 
 from .client_manager import ClientManager
 from .history import History
@@ -66,12 +76,7 @@ from .superlink.fleet.grpc_bidi.grpc_server import (
 )
 from .superlink.fleet.grpc_rere.fleet_servicer import FleetServicer
 from .superlink.fleet.grpc_rere.server_interceptor import AuthenticateServerInterceptor
-from .superlink.state import StateFactory
-
-ADDRESS_DRIVER_API = "0.0.0.0:9091"
-ADDRESS_FLEET_API_GRPC_RERE = "0.0.0.0:9092"
-ADDRESS_FLEET_API_GRPC_BIDI = "[::]:8080"  # IPv6 to keep start_server compatible
-ADDRESS_FLEET_API_REST = "0.0.0.0:9093"
+from .superlink.linkstate import LinkStateFactory
 
 DATABASE = ":flwr-in-memory-state:"
 BASE_DIR = get_flwr_dir() / "superlink" / "ffs"
@@ -79,13 +84,13 @@ BASE_DIR = get_flwr_dir() / "superlink" / "ffs"
 
 def start_server(  # pylint: disable=too-many-arguments,too-many-locals
     *,
-    server_address: str = ADDRESS_FLEET_API_GRPC_BIDI,
+    server_address: str = FLEET_API_GRPC_BIDI_DEFAULT_ADDRESS,
     server: Optional[Server] = None,
     config: Optional[ServerConfig] = None,
     strategy: Optional[Strategy] = None,
     client_manager: Optional[ClientManager] = None,
     grpc_max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
-    certificates: Optional[Tuple[bytes, bytes, bytes]] = None,
+    certificates: Optional[tuple[bytes, bytes, bytes]] = None,
 ) -> History:
     """Start a Flower server using the gRPC transport layer.
 
@@ -199,20 +204,21 @@ def start_server(  # pylint: disable=too-many-arguments,too-many-locals
 # pylint: disable=too-many-branches, too-many-locals, too-many-statements
 def run_superlink() -> None:
     """Run Flower SuperLink (Driver API and Fleet API)."""
+    args = _parse_args_run_superlink().parse_args()
+
     log(INFO, "Starting Flower SuperLink")
 
     event(EventType.RUN_SUPERLINK_ENTER)
 
-    args = _parse_args_run_superlink().parse_args()
-
-    # Parse IP address
+    # Parse IP addresses
     driver_address, _, _ = _format_address(args.driver_api_address)
+    exec_address, _, _ = _format_address(args.exec_api_address)
 
     # Obtain certificates
     certificates = _try_obtain_certificates(args)
 
     # Initialize StateFactory
-    state_factory = StateFactory(args.database)
+    state_factory = LinkStateFactory(args.database)
 
     # Initialize FfsFactory
     ffs_factory = FfsFactory(args.storage_dir)
@@ -224,17 +230,18 @@ def run_superlink() -> None:
         ffs_factory=ffs_factory,
         certificates=certificates,
     )
-
     grpc_servers = [driver_server]
+
+    # Start Fleet API
     bckg_threads = []
     if not args.fleet_api_address:
         if args.fleet_api_type in [
             TRANSPORT_TYPE_GRPC_RERE,
             TRANSPORT_TYPE_GRPC_ADAPTER,
         ]:
-            args.fleet_api_address = ADDRESS_FLEET_API_GRPC_RERE
+            args.fleet_api_address = FLEET_API_GRPC_RERE_DEFAULT_ADDRESS
         elif args.fleet_api_type == TRANSPORT_TYPE_REST:
-            args.fleet_api_address = ADDRESS_FLEET_API_REST
+            args.fleet_api_address = FLEET_API_REST_DEFAULT_ADDRESS
 
     fleet_address, host, port = _format_address(args.fleet_api_address)
 
@@ -250,7 +257,6 @@ def run_superlink() -> None:
         )
         num_workers = 1
 
-    # Start Fleet API
     if args.fleet_api_type == TRANSPORT_TYPE_REST:
         if (
             importlib.util.find_spec("requests")
@@ -278,24 +284,24 @@ def run_superlink() -> None:
         fleet_thread.start()
         bckg_threads.append(fleet_thread)
     elif args.fleet_api_type == TRANSPORT_TYPE_GRPC_RERE:
-        maybe_keys = _try_setup_client_authentication(args, certificates)
+        maybe_keys = _try_setup_node_authentication(args, certificates)
         interceptors: Optional[Sequence[grpc.ServerInterceptor]] = None
         if maybe_keys is not None:
             (
-                client_public_keys,
+                node_public_keys,
                 server_private_key,
                 server_public_key,
             ) = maybe_keys
             state = state_factory.state()
-            state.store_client_public_keys(client_public_keys)
+            state.store_node_public_keys(node_public_keys)
             state.store_server_private_public_key(
                 private_key_to_bytes(server_private_key),
                 public_key_to_bytes(server_public_key),
             )
             log(
                 INFO,
-                "Client authentication enabled with %d known public keys",
-                len(client_public_keys),
+                "Node authentication enabled with %d known public keys",
+                len(node_public_keys),
             )
             interceptors = [AuthenticateServerInterceptor(state)]
 
@@ -318,6 +324,17 @@ def run_superlink() -> None:
     else:
         raise ValueError(f"Unknown fleet_api_type: {args.fleet_api_type}")
 
+    # Start Exec API
+    exec_server: grpc.Server = run_superexec_api_grpc(
+        address=exec_address,
+        executor=load_executor(args),
+        certificates=certificates,
+        config=parse_config_args(
+            [args.executor_config] if args.executor_config else args.executor_config
+        ),
+    )
+    grpc_servers.append(exec_server)
+
     # Graceful shutdown
     register_exit_handlers(
         event_type=EventType.RUN_SUPERLINK_LEAVE,
@@ -334,7 +351,7 @@ def run_superlink() -> None:
         driver_server.wait_for_termination(timeout=1)
 
 
-def _format_address(address: str) -> Tuple[str, str, int]:
+def _format_address(address: str) -> tuple[str, str, int]:
     parsed_address = parse_address(address)
     if not parsed_address:
         sys.exit(
@@ -344,10 +361,10 @@ def _format_address(address: str) -> Tuple[str, str, int]:
     return (f"[{host}]:{port}" if is_v6 else f"{host}:{port}", host, port)
 
 
-def _try_setup_client_authentication(
+def _try_setup_node_authentication(
     args: argparse.Namespace,
-    certificates: Optional[Tuple[bytes, bytes, bytes]],
-) -> Optional[Tuple[Set[bytes], ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]]:
+    certificates: Optional[tuple[bytes, bytes, bytes]],
+) -> Optional[tuple[set[bytes], ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]]:
     if (
         not args.auth_list_public_keys
         and not args.auth_superlink_private_key
@@ -373,16 +390,16 @@ def _try_setup_client_authentication(
             "`--ssl-keyfile`, and `—-ssl-ca-certfile` and try again."
         )
 
-    client_keys_file_path = Path(args.auth_list_public_keys)
-    if not client_keys_file_path.exists():
+    node_keys_file_path = Path(args.auth_list_public_keys)
+    if not node_keys_file_path.exists():
         sys.exit(
             "The provided path to the known public keys CSV file does not exist: "
-            f"{client_keys_file_path}. "
+            f"{node_keys_file_path}. "
             "Please provide the CSV file path containing known public keys "
             "to '--auth-list-public-keys'."
         )
 
-    client_public_keys: Set[bytes] = set()
+    node_public_keys: set[bytes] = set()
 
     try:
         ssh_private_key = load_ssh_private_key(
@@ -413,13 +430,13 @@ def _try_setup_client_authentication(
             "path points to a valid public key file and try again."
         )
 
-    with open(client_keys_file_path, newline="", encoding="utf-8") as csvfile:
+    with open(node_keys_file_path, newline="", encoding="utf-8") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
             for element in row:
                 public_key = load_ssh_public_key(element.encode())
                 if isinstance(public_key, ec.EllipticCurvePublicKey):
-                    client_public_keys.add(public_key_to_bytes(public_key))
+                    node_public_keys.add(public_key_to_bytes(public_key))
                 else:
                     sys.exit(
                         "Error: Unable to parse the public keys in the CSV "
@@ -427,7 +444,7 @@ def _try_setup_client_authentication(
                         "known SSH public keys files and try again."
                     )
         return (
-            client_public_keys,
+            node_public_keys,
             ssh_private_key,
             ssh_public_key,
         )
@@ -435,7 +452,7 @@ def _try_setup_client_authentication(
 
 def _try_obtain_certificates(
     args: argparse.Namespace,
-) -> Optional[Tuple[bytes, bytes, bytes]]:
+) -> Optional[tuple[bytes, bytes, bytes]]:
     # Obtain certificates
     if args.insecure:
         log(WARN, "Option `--insecure` was set. Starting insecure HTTP server.")
@@ -489,9 +506,9 @@ def _try_obtain_certificates(
 
 def _run_fleet_api_grpc_rere(
     address: str,
-    state_factory: StateFactory,
+    state_factory: LinkStateFactory,
     ffs_factory: FfsFactory,
-    certificates: Optional[Tuple[bytes, bytes, bytes]],
+    certificates: Optional[tuple[bytes, bytes, bytes]],
     interceptors: Optional[Sequence[grpc.ServerInterceptor]] = None,
 ) -> grpc.Server:
     """Run Fleet API (gRPC, request-response)."""
@@ -517,9 +534,9 @@ def _run_fleet_api_grpc_rere(
 
 def _run_fleet_api_grpc_adapter(
     address: str,
-    state_factory: StateFactory,
+    state_factory: LinkStateFactory,
     ffs_factory: FfsFactory,
-    certificates: Optional[Tuple[bytes, bytes, bytes]],
+    certificates: Optional[tuple[bytes, bytes, bytes]],
 ) -> grpc.Server:
     """Run Fleet API (GrpcAdapter)."""
     # Create Fleet API gRPC server
@@ -542,12 +559,13 @@ def _run_fleet_api_grpc_adapter(
 
 
 # pylint: disable=import-outside-toplevel,too-many-arguments
+# pylint: disable=too-many-positional-arguments
 def _run_fleet_api_rest(
     host: str,
     port: int,
     ssl_keyfile: Optional[str],
     ssl_certfile: Optional[str],
-    state_factory: StateFactory,
+    state_factory: LinkStateFactory,
     ffs_factory: FfsFactory,
     num_workers: int,
 ) -> None:
@@ -586,6 +604,7 @@ def _parse_args_run_superlink() -> argparse.ArgumentParser:
     _add_args_common(parser=parser)
     _add_args_driver_api(parser=parser)
     _add_args_fleet_api(parser=parser)
+    _add_args_exec_api(parser=parser)
 
     return parser
 
@@ -616,6 +635,19 @@ def _add_args_common(parser: argparse.ArgumentParser) -> None:
         help="Fleet API server SSL CA certificate file (as a path str) "
         "to create a secure connection.",
         type=str,
+    )
+    parser.add_argument(
+        "--isolation",
+        default=ISOLATION_MODE_SUBPROCESS,
+        required=False,
+        choices=[
+            ISOLATION_MODE_SUBPROCESS,
+            ISOLATION_MODE_PROCESS,
+        ],
+        help="Isolation mode when running a `ServerApp` (`subprocess` by default, "
+        "possible values: `subprocess`, `process`). Use `subprocess` to configure "
+        "SuperLink to run a `ServerApp` in a subprocess. Use `process` to indicate "
+        "that a separate independent process gets created outside of SuperLink.",
     )
     parser.add_argument(
         "--database",
@@ -653,7 +685,7 @@ def _add_args_driver_api(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--driver-api-address",
         help="Driver API (gRPC) server address (IPv4, IPv6, or a domain name).",
-        default=ADDRESS_DRIVER_API,
+        default=DRIVER_API_DEFAULT_ADDRESS,
     )
 
 
@@ -679,4 +711,30 @@ def _add_args_fleet_api(parser: argparse.ArgumentParser) -> None:
         default=1,
         type=int,
         help="Set the number of concurrent workers for the Fleet API server.",
+    )
+
+
+def _add_args_exec_api(parser: argparse.ArgumentParser) -> None:
+    """Add command line arguments for Exec API."""
+    parser.add_argument(
+        "--exec-api-address",
+        help="Exec API server address (IPv4, IPv6, or a domain name)",
+        default=EXEC_API_DEFAULT_ADDRESS,
+    )
+    parser.add_argument(
+        "--executor",
+        help="For example: `deployment:exec` or `project.package.module:wrapper.exec`. "
+        "The default is `flwr.superexec.deployment:executor`",
+        default="flwr.superexec.deployment:executor",
+    )
+    parser.add_argument(
+        "--executor-dir",
+        help="The directory for the executor.",
+        default=".",
+    )
+    parser.add_argument(
+        "--executor-config",
+        help="Key-value pairs for the executor config, separated by spaces. "
+        "For example:\n\n`--executor-config 'verbose=true "
+        'root-certificates="certificates/superlink-ca.crt"\'`',
     )
